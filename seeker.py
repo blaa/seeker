@@ -29,26 +29,26 @@ def humanize(bytes):
 
 def report_part(data, cfg, full=True):
     "Print a part of a report"
-    data = data[1]
+
     # Total bytes unit
     total, unit = humanize(data['bytes_read'])
 
-    if cfg['sequential']:
-        s = "Blocks read: "
-    else:
-        s = "Seeks:       "
-    print("   {} {} ({:.1f} /s)".format(s, data['count'],
-                                        data['count'] / data['time_total']))
-    print("   Bytes read:   {:.3f} {} ({:.1f} {}/s)".format(total,
-                                                             unit,
-                                                             total / data['time_total'],
-                                                             unit))
+    print("   IOPS:       {} ({:.1f} /s)".format(data['count'],
+                                                 data['count'] / data['time_total']))
+    print("   Bytes read: {:.3f} {} ({:.1f} {}/s)".format(total,
+                                                          unit,
+                                                          total / data['time_total'],
+                                                          unit))
+    print("   Time total: {0:.3f}".format(data['time_total']))
     #print("   Total time:   %.3f" % data['time_total'])
 
     if full:
         print()
         parts_formatted = ["%.2f" % t for t in data['parts']]
-        print("   Some seek-times[ms]:", " ".join(parts_formatted[:7]), "(...) TAIL:", " ".join(parts_formatted[-7:]))
+        print("   Some seek-times[ms]:",
+              " ".join(parts_formatted[:7]),
+              "(...) TAIL:",
+              " ".join(parts_formatted[-7:]))
         print("   Average from parts: %.3f [ms]" % (sum(data['parts']) / len(data['parts'])))
         print("   Minimal / maximal: %.4f / %.4f [ms]" % (min(data['parts']), max(data['parts'])))
 
@@ -59,21 +59,27 @@ def report(results, cfg):
     where = socket.gethostname()
     size = cfg['size'] / 1024./1024.
 
+    # Filter results and errors
+    errors = [err for t, err in results if t != 'RESULT']
+    results = [err for t, err in results if t == 'RESULT']
+
     print("============ RESULTS =============")
     print("{} test at {} on {}".format(exp_type, where, when))
-    print("device={device} ({size_mb:.1f}MB) blocksize={blocksize} concurrency={concurrency} time_limit={limit}".format(size_mb=size, **cfg))
+    print(("device={device} ({size_mb:.1f}MB) blocksize={blocksize} "
+           "concurrency={concurrency} errors={errs} time_limit={limit}").format(size_mb=size,
+                                                                                errs=len(errors),
+                                                                                **cfg))
 
     # Create grouped results
     grouped = {}
     for key in ['count', 'bytes_read', 'time_total']:
-        grouped[key] = [r[1][key] for r in results
-                        if r[0] == 'RESULT']
+        grouped[key] = [data[key] for data in results]
 
     # Calculate major values
     total_bytes_read = sum(grouped['bytes_read'])
     total_bytes_read_human, total_bytes_unit = humanize(total_bytes_read)
     total_seeks = sum(grouped['count'])
-    total_workers = len(grouped)
+    total_workers = len(results)
     total_time = sum(grouped['time_total'])
     avg_time = total_time / total_workers
 
@@ -82,26 +88,29 @@ def report(results, cfg):
 
     # Grouped data
     print("=== Totals")
-    print("IOPS: {:.2f} (avg={:.2f})".format(total_seeks / avg_time,
+    print("   Time: total={0:.3f} avg={1:.3f}".format(total_time, avg_time))
+    print("   IOPS: {:.2f} (avg={:.2f})".format(total_seeks / avg_time,
                                               total_seeks / total_workers / avg_time))
-    print("{:2}/s: {:.2f} (avg={:.2f})".format(total_bytes_unit,
-                                     total_bytes_read_human,
-                                     total_bytes_read_human / total_workers))
+    print("   {:2}/s: {:.2f} (avg={:.2f})".format(total_bytes_unit,
+                                                  total_bytes_read_human / avg_time,
+                                                  total_bytes_read_human / total_workers / avg_time))
 
 
 
     # Detailed per process reports
-    for i, result in enumerate(results):
-        print()
-        print("== Worker %d" % i)
-        report_part(results[i], cfg,
-                    full=True)
+    if cfg['quiet'] is not True:
+        for i, result in enumerate(results):
+            print()
+            print("== Worker %d" % i)
+            report_part(results[i], cfg,
+                        full=True)
 
 
 
 
 
 class Worker(mp.Process):
+    "Process executing test and returning result with a pipe/queue"
 
     def __init__(self, cfg):
 
@@ -128,7 +137,7 @@ class Worker(mp.Process):
                                  cfg['limit'],
                                  do_random=not cfg['sequential'])
 
-        except Exception, e:
+        except Exception as e:
             import traceback as tb
             print("EXCEPTION ON THREAD", self.name)
             tb.print_exc()
@@ -160,7 +169,6 @@ class Worker(mp.Process):
                 data = os.read(dev, block_size)
                 bytes_read += len(data)
 
-                count += 1
                 time_cur = time()
                 if count % 1000 == 0:
                     parts.append((time_cur - time_prev) * 1000)
@@ -169,6 +177,7 @@ class Worker(mp.Process):
                 if time_cur - time_start > time_limit:
                     break
                 time_prev = time_cur
+                count += 1
         finally:
             os.close(dev)
 
@@ -199,6 +208,9 @@ def parse_args():
                         help='number of parallel processes/disc queue depth')
     parser.add_argument('--sequential', action="store_true",
                         help='instead of random IOPS do sequential test')
+    parser.add_argument('-q', '--quiet', action="store_true",
+                        help='skip detailed worker results')
+
     args = parser.parse_args()
 
     assert args.limit > 0.1
@@ -246,6 +258,7 @@ def main():
         'limit': args.limit,
         'start': datetime.now(),
         'concurrency': args.concurrency,
+        'quiet': args.quiet,
     }
 
     if cfg['blocksize'] is None:
@@ -259,7 +272,7 @@ def main():
 
     for worker in workers:
         worker.start()
-    print("-> Measurements started - waiting for results", file=sys.stderr)
+    print("-> Measuring using {concurrency} processes for {limit} seconds".format(**cfg), file=sys.stderr)
 
     try:
         results = [
